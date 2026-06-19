@@ -1749,29 +1749,68 @@ function tbIsHeaderRow(row){
 }
 
 function tbParseClientBlocks(aos){
-  const norm=s=>(s||"").toString().toLowerCase().replace(/[^a-z0-9 ]/g,"").trim();
-  const blocks={};let firstDataIdx=0;
-  for(let i=0;i<Math.min(aos.length,13);i++){if(tbIsHeaderRow(aos[i])){firstDataIdx=i+1;break;}}
+  // Find first real header row (skip metadata rows at top)
+  let firstDataIdx=0;
+  for(let i=0;i<Math.min(aos.length,13);i++){
+    if(tbIsHeaderRow(aos[i])){firstDataIdx=i+1;break;}
+  }
   const headerRow=aos[firstDataIdx-1]||[];
-  const colIds={};headerRow.forEach((h,i)=>{colIds[norm(h)]=i;});
-  const get=(row,hints)=>{const n=norm;const found=Object.keys(colIds).find(k=>hints.some(h=>n(k)===h||n(k).includes(h)));if(found===undefined)return"";return(row[colIds[found]]||"").toString().trim();};
-  let i=firstDataIdx;
-  while(i<aos.length){
+  const norm=s=>(s||"").toString().toLowerCase().replace(/[^a-z0-9 ]/g,"").trim();
+
+  // Build column index map from header
+  const colIds={};
+  headerRow.forEach((h,i)=>{colIds[norm(h)]=i;});
+
+  // Flexible column getter with hint matching
+  const get=(row,hints)=>{
+    const found=Object.keys(colIds).find(k=>hints.some(h=>norm(k)===h||norm(k).includes(h)||h.includes(norm(k))));
+    if(found===undefined)return"";
+    return(row[colIds[found]]||"").toString().trim();
+  };
+
+  // Parse every data row into individual break records
+  const blocks={};
+  for(let i=firstDataIdx;i<aos.length;i++){
     const row=aos[i];
-    if(!row.some(v=>(v||"").toString().trim())||tbIsHeaderRow(row)){i++;continue;}
-    const clientName=get(row,TB_COL_HINTS.shortname);
-    const account=get(row,TB_COL_HINTS.account).toUpperCase();
-    const symbol=get(row,TB_COL_HINTS.symbol);const secName=get(row,TB_COL_HINTS.secname);
-    const side=get(row,TB_COL_HINTS.side);const qty=get(row,TB_COL_HINTS.qty);
-    const price=get(row,TB_COL_HINTS.amount);const settDate=get(row,TB_COL_HINTS.settdate);
-    const comment=get(row,TB_COL_HINTS.control);const clearingBroker=get(row,TB_COL_HINTS.broker);
-    const mpid=tbNorm(clearingBroker);
-    if(!account&&(!clientName&&!symbol)){i++;continue;}
-    const key=account||clientName;
-    if(!blocks[key]){blocks[key]={clientName:clientName||account,account,mpid:mpid||clearingBroker,breaks:[]};}
-    const breakRow={reportedBy:"",symbol,secName,side,qty,price,amount:price,settDate,broker:clearingBroker,comment,controlNum:comment,mpid,clearingBroker,primaryStatus:"",exposure:""};
-    blocks[key].breaks.push({pershing:breakRow,broker:null});
-    i++;
+    if(!row||!row.some(v=>(v||"").toString().trim()))continue;
+    if(tbIsHeaderRow(row))continue; // skip repeated headers between client blocks
+
+    const clientName = get(row,["name","client","short name","shortname"]);
+    const account    = get(row,["account","acct","3dt","proc","processing"]).toUpperCase().trim();
+    const reportedBy = get(row,["reported by","reportedby","reported"]);
+    const cusip      = get(row,["cusip","security id"]);
+    const symbol     = get(row,["symbol","sym","ticker"]);
+    const secName    = get(row,["security name","secname","security"]);
+    const side       = get(row,["side","buy/sell","direction"]);
+    const qty        = get(row,["quantity","qty","shares"]);
+    const price      = get(row,["price"]);
+    const comm       = get(row,["comm","commission"]);
+    const interest   = get(row,["interest"]);
+    const amount     = get(row,["amount","value","net amount"]);
+    const tradeDate  = get(row,["trade date","tradedate","trade da"]);
+    const settDate   = get(row,["sett date","settdate","settle date","sett da"]);
+    const broker     = get(row,["broker","clearing broker","clr broker"]);
+    const comment    = get(row,["comment","comments","primary status","status"]);
+    const controlNum = get(row,["control","control #","control number","ctrl"]);
+
+    if(!account&&!clientName)continue;
+    const key=account||(clientName.toUpperCase());
+
+    if(!blocks[key]){
+      blocks[key]={
+        clientName:clientName||account,
+        account,
+        breaks:[]
+      };
+    }
+
+    blocks[key].breaks.push({
+      clientName:clientName||blocks[key].clientName,
+      account,
+      reportedBy,
+      cusip,symbol,secName,side,qty,price,comm,interest,amount,
+      tradeDate,settDate,broker,comment,controlNum
+    });
   }
   return Object.values(blocks);
 }
@@ -1782,51 +1821,83 @@ function tbGetCol(id){return document.getElementById("tb-col-"+id).value;}
 
 function tbMatchAll(){
   tbApplySorterStage();
+
+  // Build lookup maps
   const pcByAccount={};
-  pcData.forEach(r=>{const acc=(r["Account"]||"").trim().toUpperCase();if(acc)pcByAccount[acc]=pcByAccount[acc]||[];pcByAccount[acc].push(r);});
-  const cbByMpid={};
-  cbData.forEach(r=>{["MPID","DTCC Number"].forEach(k=>{const v=(r[k]||"").replace(/^0+/,"").toUpperCase();if(v)cbByMpid[v]=r;});});
-  let totalClients=0,matched=0,unmatched=0;
-  const groups={};
+  pcData.forEach(r=>{
+    const acc=(r["Account"]||"").trim().toUpperCase();
+    if(acc){pcByAccount[acc]=pcByAccount[acc]||[];pcByAccount[acc].push(r);}
+  });
+
+  const groups={}; // key = account (3DT number) → one email per account
+  let totalBreaks=0,matched=0,unmatched=0;
+
   ["1","2","3"].forEach(slot=>{
     const fileData=tbFiles[slot];
     if(!fileData||!fileData.blocks)return;
-    tbApplySorterToBlocks(fileData.blocks);
+
     fileData.blocks.forEach(block=>{
-      totalClients++;
       const acc=(block.account||"").toUpperCase();
       if(!acc)return;
+
       const pcRows=pcByAccount[acc]||[];
       const pcMatch=pcRows[0]||null;
-      const mpid=tbNorm(block.mpid||"");
-      const cbMatch=pcMatch&&mpid?cbByMpid[mpid]||(null):null;
-      if(!pcMatch&&!cbMatch){unmatched++;return;}
-      matched++;
-      const key=acc;
-      if(!groups[key]){
-        const toEmails=new Set();
-        if(pcMatch){pcRows.map(r=>(r["Email Address"]||"").trim()).filter(Boolean).forEach(e=>toEmails.add(e));}
-        const ccEmails=new Set(["primesupport@bny.com"]);
-        if(pcMatch){
-          pcRows.map(r=>resolveAmEmail(r["Account Manager 1"]||"")).filter(Boolean).forEach(e=>ccEmails.add(e));
-          pcRows.map(r=>resolveAmEmail(r["Account Manager 2"]||"")).filter(Boolean).forEach(e=>ccEmails.add(e));
+
+      block.breaks.forEach(br=>{
+        totalBreaks++;
+        if(!pcMatch){unmatched++;return;}
+        matched++;
+
+        if(!groups[acc]){
+          // Collect all unique To emails from all contacts for this account
+          const toEmails=new Set();
+          pcRows.forEach(r=>{if(r["Email Address"]&&r["Email Address"].trim())toEmails.add(r["Email Address"].trim());});
+
+          // CC: primesupport + resolved AM emails
+          const ccEmails=new Set(["primesupport@bny.com"]);
+          pcRows.forEach(r=>{
+            const am1=resolveAmEmail(r["Account Manager 1"]||"");
+            const am2=resolveAmEmail(r["Account Manager 2"]||"");
+            if(am1)ccEmails.add(am1);
+            if(am2)ccEmails.add(am2);
+          });
+
+          groups[acc]={
+            key:acc,
+            account:acc,
+            clientName:pcMatch["Pershing Client"]||acc,
+            pcMatch,pcRows,
+            toEmails:[...toEmails],
+            ccEmails:[...ccEmails],
+            // All breaks grouped by file slot
+            breaksByType:{"1":[],"2":[],"3":[]},
+          };
         }
-        groups[key]={
-          key:acc,account:acc,
-          clientName:pcMatch?pcMatch["Pershing Client"]:(cbMatch?cbMatch["Contra Broker Name"]:block.clientName||acc),
-          type:pcMatch?"prime":"contra",
-          pcMatch,pcRows,cbMatch,
-          toEmails:[...toEmails],ccEmails:[...ccEmails],
-          breaksByType:{"1":[],"2":[],"3":[]},
-        };
-      }
-      groups[key].breaksByType[slot].push({slot,breakLabel:TB_BREAK_TYPES[slot].label,breakShort:TB_BREAK_TYPES[slot].short,breakColor:TB_BREAK_TYPES[slot].color,pershing:block.breaks[0]?.pershing||null,broker:block.breaks[0]?.broker||null,symbol:block.breaks[0]?.pershing?.symbol||"",secName:block.breaks[0]?.pershing?.secName||"",side:block.breaks[0]?.pershing?.side||"",qty:block.breaks[0]?.pershing?.qty||"",amount:block.breaks[0]?.pershing?.amount||"",settDate:block.breaks[0]?.pershing?.settDate||"",comment:block.breaks[0]?.pershing?.comment||"",controlNum:block.breaks[0]?.pershing?.controlNum||""});
+
+        // Add the individual break row with all fields
+        groups[acc].breaksByType[slot].push({
+          ...br,
+          slot,
+          breakLabel:TB_BREAK_TYPES[slot].label,
+          breakColor:TB_BREAK_TYPES[slot].color,
+        });
+      });
     });
   });
 
-  tbMatched=Object.values(groups).sort((a,b)=>tbCompareAsc(a.account||"",b.account||"")||tbCompareAsc(a.clientName||"",b.clientName||""));
-  tbMatched.forEach(g=>{["1","2","3"].forEach(slot=>g.breaksByType[slot].sort(tbSorterBreakCompare));});
-  tbRenderResults(totalClients,matched,unmatched);
+  // Sort by account number, then sort breaks within each group by settlement date
+  tbMatched=Object.values(groups).sort((a,b)=>tbCompareAsc(a.account,b.account));
+  tbMatched.forEach(g=>{
+    ["1","2","3"].forEach(slot=>{
+      g.breaksByType[slot].sort((a,b)=>
+        tbCompareAsc(a.reportedBy||"",b.reportedBy||"")||
+        tbCompareAsc(a.settDate||"",b.settDate||"")||
+        tbCompareAsc(a.symbol||"",b.symbol||"")
+      );
+    });
+  });
+
+  tbRenderResults(totalBreaks,matched,unmatched);
   tbRenderEmailQueue();
 }
 
@@ -1852,100 +1923,168 @@ function tbRenderEmailQueue(){
   const queueEl=document.getElementById("tb-email-queue");
   queueEl.innerHTML="";
   tbMatched.forEach((g,i)=>{
+    const allBreaks=[...g.breaksByType["1"],...g.breaksByType["2"],...g.breaksByType["3"]];
     const c1=g.breaksByType["1"].length,c2=g.breaksByType["2"].length,c3=g.breaksByType["3"].length;
+    const pershingCount=allBreaks.filter(b=>(b.reportedBy||"").toLowerCase().includes("pershing")).length;
+    const brokerCount=allBreaks.filter(b=>(b.reportedBy||"").toLowerCase().includes("broker")).length;
+
     let pills="";
     if(c1)pills+=`<span style="background:#7c1a1a;color:#ff7b7b;border-radius:999px;padding:1px 7px;font-size:10px;font-weight:700;margin-right:3px;">${c1} ID Confirm</span>`;
-    if(c2)pills+=`<span style="background:#5a4700;color:#ffd75e;border-radius:999px;padding:1px 7px;font-size:10px;font-weight:700;margin-right:3px;">${c2} No Confirms</span>`;
+    if(c2)pills+=`<span style="background:#5a4700;color:#ffd75e;border-radius:999px;padding:1px 7px;font-size:10px;font-weight:700;margin-right:3px;">${c2} No Confirm</span>`;
     if(c3)pills+=`<span style="background:#0d4260;color:#6ee7ff;border-radius:999px;padding:1px 7px;font-size:10px;font-weight:700;margin-right:3px;">${c3} Poss Match</span>`;
+
+    let reportedByLine="";
+    if(pershingCount)reportedByLine+=`<span style="color:#4f8ef7;">${pershingCount} Pershing</span>`;
+    if(pershingCount&&brokerCount)reportedByLine+=` · `;
+    if(brokerCount)reportedByLine+=`<span style="color:#ffb454;">${brokerCount} Broker</span>`;
+
+    // Determine message preview
+    const msgPreview=brokerCount>0&&pershingCount===0
+      ? "Please confirm if this is a valid trade for Pershing Prime?"
+      : brokerCount>0
+      ? "Please confirm valid trades &amp; have brokers face SSI's below."
+      : "Please have broker(s) face our SSI's below.";
+
     const card=document.createElement("div");
     card.id=`tb-card-${i}`;
     card.style.cssText="background:var(--panel2);border:1px solid var(--border);border-radius:9px;padding:12px;";
     card.innerHTML=`
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:6px;">
         <div>
-          <span style="font-size:10px;font-weight:700;color:var(--text-dim);text-transform:uppercase;">${escHtml(g.type==="prime"?"▸ PRIME":"▸ CONTRA")}</span>
-          <div style="font-size:13px;font-weight:700;margin-top:1px;">${escHtml(g.clientName)}</div>
-          <div style="font-family:var(--mono);font-size:11px;color:var(--text-dim);">${escHtml(g.account)}</div>
+          <div style="font-size:13px;font-weight:700;">${escHtml(g.clientName)}</div>
+          <div style="font-family:var(--mono);font-size:11px;color:#cc6600;font-weight:700;">${escHtml(g.account)}</div>
         </div>
-        <div style="margin-bottom:7px;">${pills}</div>
+        <div style="text-align:right;">${pills}</div>
       </div>
-      <div style="margin-bottom:7px;">
-        <p style="font-size:11.5px;color:var(--text-dim);margin:0 0 3px 0;line-height:1.7;">
-          <b>To:</b> ${(g.toEmails.length?g.toEmails:["no emails on file"]).map(escHtml).join("<br>")||"&mdash;"}<br>
-          <b>CC:</b> ${(g.ccEmails.map(escHtml).join(", "))||"&mdash;"}
-        </p>
+      <div style="font-size:10.5px;color:var(--text-dim);margin-bottom:4px;">Reported by: ${reportedByLine||"unknown"}</div>
+      <div style="font-size:10.5px;color:var(--text-dim);font-style:italic;margin-bottom:6px;">"${msgPreview}"</div>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;line-height:1.6;">
+        <b>To:</b> ${(g.toEmails.length?g.toEmails:["⚠ no emails on file"]).map(escHtml).join(", ")}<br>
+        <b>CC:</b> ${g.ccEmails.map(escHtml).join(", ")||"—"}
       </div>
       <button class="primary small tb-send-card outlook-btn" data-idx="${i}" style="width:100%;">📧 Generate Email</button>
-      <div id="tb-card-sent-${i}" style="font-size:10.5px;color:var(--good);margin-top:5px;text-align:center;display:none;">✓ Draft downloaded</div>`;
+      <div id="tb-card-sent-${i}" style="font-size:10.5px;color:var(--good);margin-top:5px;text-align:center;display:none;">✓ Outlook opened</div>`;
     queueEl.appendChild(card);
   });
   document.getElementById("tb-send-all-btn").textContent=`📧 Send Next (${tbMatched.length} remaining)`;
 }
 
-// Build the email body for a trade break group
+// ── Email body builder — matches real Outlook email format ─────────────────
 function tbBuildEmailBody(g){
-  const tmpl=PC_TEMPLATES[0];
-  const body=tmpl.body;
-  const breakTables=["1","2","3"].map(slot=>buildTable(slot)).join("\n\n");
-  function buildTable(slot){
-    const breaks=g.breaksByType[slot];if(!breaks.length)return"";
-    const bt=TB_BREAK_TYPES[slot];
-    let html=`<p style="margin:12px 0 4px;"><span style="background:${bt.color};color:#000;border-radius:3px;padding:2px 8px;font-size:12px;font-weight:700;">${bt.label}</span> ${breaks.length} break${breaks.length>1?"s":""}</p>`;
-    html+=`<table style="border-collapse:collapse;width:100%;font-family:Calibri,Arial,sans-serif;font-size:11px;margin-bottom:16px;"><thead><tr>`;
-    const COLS=[{key:"name",label:"Name"},{key:"account",label:"Account"},{key:"reportedBy",label:"Reported By"},{key:"cusip",label:"Cusip"},{key:"symbol",label:"Symbol"},{key:"secName",label:"Security Name"},{key:"side",label:"Side"},{key:"qty",label:"Quantity"},{key:"price",label:"Price"},{key:"amount",label:"Amount"},{key:"tradeDate",label:"Trade Date"},{key:"settDate",label:"Sett Date"},{key:"broker",label:"Broker"},{key:"comment",label:"Comment"}];
-    const tStyle="border-collapse:collapse;width:100%;font-family:Calibri,Arial,sans-serif;font-size:11px;margin-bottom:16px;";
-    const thStyle="background:#f2f4f6;color:#000000;border:1px solid #b8c4d0;padding:4px 6px;text-align:left;font-weight:bold;white-space:nowrap;";
-    const tdStyle="border:1px solid #b8c4d0;padding:3px 6px;white-space:nowrap;background:#f0f4f8;";
-    COLS.forEach(c=>{html+=`<th style="${thStyle}">${c.label}</th>`;});
-    html+="</tr></thead><tbody>";
-    let rowIdx=0;
-    breaks.forEach(bp=>{
-      const rowsToRender=[];
-      if(bp.pershing)rowsToRender.push(bp.pershing);
-      if(bp.broker)rowsToRender.push(bp.broker);
-      if(bp.standalone&&!bp.pershing&&!bp.broker)rowsToRender.push(bp.standalone);
-      rowsToRender.forEach(rowData=>{
-        const alt=rowIdx%2===1;
-        html+=`<tr>`;
-        COLS.forEach(c=>{
-          let val="";
-          if(c.key==="name")val=g.clientName;
-          else if(c.key==="account")val=g.account;
-          else val=(rowData[c.key]||"");
-          html+=`<td style="${tdStyle}${alt?"background:#fff;":""}">${escHtml(val)}</td>`;
-        });
-        html+="</tr>";rowIdx++;
-      });
-      // Highlight differences
-      if(bp.pershing&&bp.broker){
-        const diffs=[];
-        if(bp.pershing.qty!==bp.broker.qty)diffs.push(`Qty: Pershing ${bp.pershing.qty} vs Broker ${bp.broker.qty}`);
-        if(bp.pershing.amount!==bp.broker.amount)diffs.push(`Amt: Pershing ${bp.pershing.amount} vs Broker ${bp.broker.amount}`);
-        if(bp.pershing.side!==bp.broker.side)diffs.push(`Side: Pershing ${bp.pershing.side} vs Broker ${bp.broker.side}`);
-        if(bp.pershing.symbol!==bp.broker.symbol)diffs.push(`Symbol: Pershing ${bp.pershing.symbol} vs Broker ${bp.broker.symbol}`);
-        if(diffs.length){html+=`<tr><td colspan="${COLS.length}" style="border:1px solid #b8c4d0;padding:2px 5px;background:#fff3cd;color:#856404;font-weight:bold;font-size:11px;">⚠ DIFFERENCE: ${escHtml(diffs.join(" | "))}</td></tr>`;}
+  const account=g.account;
+
+  // Collect all breaks across all slots
+  const allBreaks=[...g.breaksByType["1"],...g.breaksByType["2"],...g.breaksByType["3"]];
+
+  // Determine message line based on Reported By
+  // If ALL rows are Pershing → SSI message
+  // If ANY row is Broker → "Please confirm if this is a valid trade for Pershing Prime"
+  // Mixed → both messages
+  const pershingBreaks=allBreaks.filter(b=>(b.reportedBy||"").toLowerCase().includes("pershing"));
+  const brokerBreaks  =allBreaks.filter(b=>(b.reportedBy||"").toLowerCase().includes("broker")||(b.reportedBy||"").toLowerCase().includes("brkr"));
+  const unknownBreaks =allBreaks.filter(b=>!pershingBreaks.includes(b)&&!brokerBreaks.includes(b));
+
+  // All breaks together go in one table — Reported By column distinguishes them
+  const msgLine = brokerBreaks.length>0 && pershingBreaks.length===0
+    ? "Please confirm if this is a valid trade for Pershing Prime?"
+    : brokerBreaks.length>0
+    ? "Please confirm if these are valid trades for Pershing Prime, and have brokers face our SSI's below."
+    : "Please have broker(s) face our SSI's below.";
+
+  // Build the HTML trade table (matching your Outlook format exactly)
+  const thStyle="background:#d0d7e0;color:#000;border:1px solid #9aaabb;padding:4px 6px;text-align:left;font-weight:bold;white-space:nowrap;font-size:11px;";
+  const tdStyle="border:1px solid #b8c4d0;padding:3px 6px;white-space:nowrap;font-size:11px;background:#f8fafc;";
+  const tdAltStyle="border:1px solid #b8c4d0;padding:3px 6px;white-space:nowrap;font-size:11px;background:#ffffff;";
+  const tdRedStyle="border:1px solid #b8c4d0;padding:3px 6px;white-space:nowrap;font-size:11px;color:#cc0000;font-weight:bold;";
+
+  const COLS=[
+    {key:"clientName",label:"Name"},
+    {key:"account",   label:"Account"},
+    {key:"reportedBy",label:"Reported By"},
+    {key:"cusip",     label:"Cusip"},
+    {key:"symbol",    label:"Symbol"},
+    {key:"secName",   label:"Security Name"},
+    {key:"side",      label:"Side"},
+    {key:"qty",       label:"Quantity"},
+    {key:"price",     label:"Price"},
+    {key:"comm",      label:"Comm"},
+    {key:"interest",  label:"Interest"},
+    {key:"amount",    label:"Amount"},
+    {key:"tradeDate", label:"Trade Date"},
+    {key:"settDate",  label:"Sett Date"},
+    {key:"broker",    label:"Broker"},
+    {key:"comment",   label:"Comment"},
+  ];
+
+  let tableHtml=`<table style="border-collapse:collapse;width:100%;font-family:Calibri,Arial,sans-serif;font-size:11px;margin:12px 0 16px;">`;
+  tableHtml+=`<thead><tr>${COLS.map(c=>`<th style="${thStyle}">${c.label}</th>`).join("")}</tr></thead><tbody>`;
+
+  allBreaks.forEach((br,idx)=>{
+    const isAlt=idx%2===1;
+    tableHtml+=`<tr>`;
+    COLS.forEach(c=>{
+      const val=(br[c.key]||"").toString();
+      if(c.key==="comment"&&val){
+        tableHtml+=`<td style="${tdRedStyle}">${escHtml(val)}</td>`;
+      } else if(c.key==="account"){
+        tableHtml+=`<td style="${isAlt?tdAltStyle:tdStyle}"><span style="color:#cc6600;font-weight:bold;">${escHtml(val)}</span></td>`;
+      } else {
+        tableHtml+=`<td style="${isAlt?tdAltStyle:tdStyle}">${escHtml(val)}</td>`;
       }
     });
-    html+="</tbody></table>";
-    return html;
-  }
+    tableHtml+=`</tr>`;
+  });
+  tableHtml+=`</tbody></table>`;
 
-  if(g.type==="prime"){
-    const account=g.account;
-    const settlementHtml=buildSettlementHtml(account);
-    const settlement=PC_SETTLEMENT_BLOCK.replace(/\{\{ACCOUNT\}\}/g,account);
-    return{body:`Hello,\n\n${body}\n\n${settlement}\n\n${emailSignature}`,htmlExtra:breakTables+settlementHtml};
-  }else{
-    return{body:`Hello,\n\n${body}\n\n[BREAK TABLE]\n\n${emailSignature}`,htmlExtra:breakTables};
-  }
+  // Settlement instructions HTML (yellow highlight, orange 3DT, matching your emails)
+  const ssiHtml=`
+<div style="font-family:Calibri,Arial,sans-serif;font-size:12px;line-height:1.8;margin-top:12px;">
+  <p style="margin:0 0 4px;"><b><u style="background:#ffff00;">Pershing Settlement Instructions:</u></b></p>
+  <p style="margin:0;background:#ffff00;display:inline-block;padding:2px 0;">
+    <b>TREASURIES: (FED)</b><br>
+    Bank of NYC/Pershing<br>
+    ABA # 021000018<br>
+    Internal Pershing account number <b style="color:#cc6600;">${escHtml(account)}</b>
+  </p>
+  <br><br>
+  <p style="margin:0;background:#ffff00;display:inline-block;padding:2px 0;">
+    <b>DTC#443</b><br>
+    Agent Bank # 94109<br>
+    Institutional Bank # 94109<br>
+    Internal Pershing customer a/c # <b style="color:#cc6600;">${escHtml(account)}</b>
+  </p>
+</div>`;
+
+  // Plain text version
+  const plainText=`Good morning,\n\n${msgLine}\n\n`
+    +allBreaks.map((br,i)=>`${i+1}. ${br.clientName} | ${br.account} | ${br.reportedBy} | ${br.symbol||br.cusip} | ${br.secName} | ${br.side} | Qty:${br.qty} | ${br.settDate} | ${br.broker} | ${br.comment}`).join("\n")
+    +`\n\nPershing Settlement Instructions:\nTREASURIES: (FED)\nBank of NYC/Pershing\nABA # 021000018\nInternal Pershing account number ${account}\n\nDTC#443\nAgent Bank # 94109\nInstitutional Bank # 94109\nInternal Pershing customer a/c # ${account}\n\n${emailSignature}`;
+
+  // Full HTML email body
+  const htmlBody=`<html><body style="font-family:Calibri,Arial,sans-serif;font-size:13px;line-height:1.6;color:#000;">
+    <p>Good morning,</p>
+    <p>${escHtml(msgLine)}</p>
+    ${tableHtml}
+    ${ssiHtml}
+    <br><br>
+    <pre style="font-family:Calibri,Arial,sans-serif;font-size:12px;margin:0;white-space:pre-wrap;">${escHtml(emailSignature)}</pre>
+  </body></html>`;
+
+  return{textBody:plainText,htmlBody};
 }
 
 function tbBuildSubject(g){
-  const base=g.type==="prime"?"Prime Client Contact Follow-up":"Trade Break Notification";
-  const c1=g.breaksByType["1"].length,c2=g.breaksByType["2"].length,c3=g.breaksByType["3"].length;
-  const typeTags=["1","2","3"].filter(s=>g.breaksByType[s].length>0).map(s=>TB_BREAK_TYPES[s].short).join(" | ");
-  const commentTag=(()=>{const allBreaks=[...g.breaksByType["1"],...g.breaksByType["2"],...g.breaksByType["3"]];const comments=[...new Set(allBreaks.map(b=>b.comment).filter(Boolean))];return comments.length?`(${comments.slice(0,2).join(", ")})`:"";})();
-  return`${base} — ${g.clientName}/${g.account} [${typeTags}]${commentTag}`;
+  const allBreaks=[...g.breaksByType["1"],...g.breaksByType["2"],...g.breaksByType["3"]];
+  const pershingBreaks=allBreaks.filter(b=>(b.reportedBy||"").toLowerCase().includes("pershing"));
+  const brokerBreaks=allBreaks.filter(b=>(b.reportedBy||"").toLowerCase().includes("broker"));
+  // Collect break type tags
+  const typeTags=[];
+  if(g.breaksByType["1"].length)typeTags.push("ID Confirm");
+  if(g.breaksByType["2"].length)typeTags.push("No Confirm");
+  if(g.breaksByType["3"].length)typeTags.push("Poss Match");
+  const typeStr=typeTags.length?` [${typeTags.join(" | ")}]`:"";
+  // Subject: "{Client} Trade Breaks ({3DT}){typeStr} *Today SD*"
+  return`${g.clientName} Trade Breaks (${g.account})${typeStr}`;
 }
 
 async function tbSendCard(idx){
@@ -1953,17 +2092,14 @@ async function tbSendCard(idx){
   const toEmails=g.toEmails||[];
   const ccEmails=g.ccEmails||["primesupport@bny.com"];
   const subject=tbBuildSubject(g);
-  const {body,htmlExtra}=tbBuildEmailBody(g);
-  const markerText="[BREAK TABLE]";
-  const introText=body.includes(markerText)?body.split(markerText)[0].trim():body.trim();
-  const htmlBody=buildFullHtmlEmail({introText,htmlExtra:htmlExtra||"",signatureText:""});
-  const textBody=renderBodyWithoutMarkers(body).replace(/\[BREAK TABLE\]/g,"").trim();
+  const {textBody,htmlBody}=tbBuildEmailBody(g);
   await sendToOutlook({
-    to:toEmails,cc:ccEmails,subject,textBody,htmlBody,
+    to:toEmails,cc:ccEmails,subject,
+    textBody,htmlBody,
     filename:safeFilename(`${g.clientName}_${g.account}`)
   });
   const sentEl=document.getElementById(`tb-card-sent-${idx}`);
-  if(sentEl){sentEl.style.display="block";sentEl.textContent="✓ Outlook opened / draft downloaded";}
+  if(sentEl){sentEl.style.display="block";sentEl.textContent="✓ Outlook opened";}
   const btn=document.querySelector(`.tb-send-card[data-idx="${idx}"]`);
   if(btn){btn.textContent="✓ Sent";btn.disabled=true;}
   tbQueueIdx=idx+1;
